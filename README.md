@@ -112,7 +112,30 @@ index=auth action=failure
 
 ---
 
-## 7. Correlation & lookups
+## 7. CIM — standard field names
+
+Splunk's **Common Information Model (CIM)** normalizes field names across sources so a search works the same whether the data comes from a firewall, a proxy or an EDR. Use these names instead of arbitrary ones (`src` not `ip_origen`, `user` not `usuario`) to keep searches portable across real environments.
+
+> El **CIM** normaliza los nombres de campos entre distintas fuentes. Usar la nomenclatura estándar (`src`, `user`, `action`…) en vez de nombres propios hace que tus búsquedas sean portables a entornos reales.
+
+| CIM field | Meaning | Common in |
+|-----------|---------|-----------|
+| `src` / `src_ip` | Source host / IP | Network, Authentication |
+| `dest` / `dest_ip` | Destination host / IP | Network, Web |
+| `src_port` / `dest_port` | Source / destination port | Network |
+| `user` | Account involved | Authentication, Endpoint |
+| `action` | Outcome (`success`, `failure`, `allowed`, `blocked`) | Most models |
+| `app` | Application / service | Web, Network |
+| `bytes_in` / `bytes_out` | Bytes received / sent | Network |
+| `signature` | Rule / alert name | IDS, Malware |
+| `dvc` | Device that reported the event | Most models |
+| `vendor_product` | Source product (e.g. `Cisco ASA`) | All |
+
+> Tip: align to CIM and your queries plug straight into Splunk Enterprise Security and accelerated data models.
+
+---
+
+## 8. Correlation & lookups
 
 | Command | Use |
 |---------|-----|
@@ -130,40 +153,69 @@ index=firewall
 
 ---
 
-## 8. Security / threat-hunting patterns
+## 9. Security / threat-hunting patterns
 
-**Brute force (many failures, one source):**
+**Hunting vs Alerting** — know which one you're writing. A *hunt* is exploratory: high-cardinality, wide time range, run on demand, you read the results yourself. An *alert* is production: tightly filtered, narrow window, runs on a schedule against the Search Head, and must be cheap because it fires over and over. Don't put an expensive hunt on a 5-minute cron — it will hammer the cluster.
+
+> Diferenciá *hunting* (exploratorio, manual, ventana amplia) de *alerting* (programado, filtrado estricto, ventana corta). Una búsqueda de hunting cara corriendo cada 5 minutos como alerta satura el Search Head en producción.
+
+Each pattern is tagged with its **MITRE ATT&CK** tactic and technique so the search maps directly to a detection use case.
+
+> Cada patrón está mapeado a su táctica y técnica de **MITRE ATT&CK**, para que cada búsqueda se traduzca a un caso de detección concreto (útil en un SOC / respuesta a incidentes).
+
+**Brute force — many failures, one source**
+`Credential Access` · [T1110 — Brute Force](https://attack.mitre.org/techniques/T1110/)
 ```spl
 index=auth action=failure
 | bin _time span=5m
-| stats count by _time, src_ip
-| where count > 10
+| stats count AS failures, dc(user) AS users_tried by _time, src_ip
+| where failures > 10
 ```
 
-**Possible data exfiltration (large outbound):**
+**Password spraying — one source, many accounts, few attempts each**
+`Credential Access` · [T1110.003 — Password Spraying](https://attack.mitre.org/techniques/T1110/003/)
+```spl
+index=auth action=failure
+| bin _time span=10m
+| stats dc(user) AS users_targeted, count AS attempts by _time, src_ip
+| where users_targeted > 15 AND attempts < 50
+```
+
+**Possible data exfiltration — large outbound transfer**
+`Exfiltration` · [T1048 — Exfiltration Over Alternative Protocol](https://attack.mitre.org/techniques/T1048/)
 ```spl
 index=firewall direction=outbound
-| stats sum(bytes_out) AS total by src_ip
+| stats sum(bytes_out) AS total by src_ip, dest_ip
 | where total > 1000000000
 | sort -total
 ```
 
-**Rare process per host (anomaly):**
+**Rare process per host — living-off-the-land / anomaly**
+`Execution` · [T1059 — Command and Scripting Interpreter](https://attack.mitre.org/techniques/T1059/)
 ```spl
 index=endpoint sourcetype=process
 | rare limit=20 process by host
 ```
 
-**First-time-seen (new value not seen before):**
+**First-time-seen — new user/source pair (possible valid-account abuse)**
+`Initial Access / Persistence` · [T1078 — Valid Accounts](https://attack.mitre.org/techniques/T1078/)
 ```spl
 index=auth
 | stats earliest(_time) AS first_seen by user, src_ip
 | where first_seen > relative_time(now(), "-24h")
 ```
 
+**Impossible travel — same user, two far-apart sources fast**
+`Credential Access` · [T1078 — Valid Accounts](https://attack.mitre.org/techniques/T1078/)
+```spl
+index=auth action=success
+| stats dc(src_ip) AS distinct_ips, values(src_ip) AS ips by user
+| where distinct_ips > 1
+```
+
 ---
 
-## 9. Output & visualization
+## 10. Output & visualization
 
 | Command | Use |
 |---------|-----|
@@ -175,7 +227,7 @@ index=auth
 
 ---
 
-## 10. Performance tips
+## 11. Performance tips
 
 - Always specify `index=` and `sourcetype=` — never search `index=*` in production.
 - Filter **before** the first `|`; transform after.
@@ -183,6 +235,16 @@ index=auth
 - Prefer `tstats` over `stats` on large/accelerated datasets.
 - Avoid `join` and `transaction` when `stats by` can do the job.
 - Narrow the time range — it's the single biggest performance lever.
+
+**Search modes** — pick the cheapest that answers your question:
+
+| Mode | What it does | When to use |
+|------|--------------|-------------|
+| **Fast** | Skips field discovery, returns only fields used in the search | Dashboards, scheduled alerts, large datasets |
+| **Smart** | Default — switches behavior based on the search type | General day-to-day searching |
+| **Verbose** | Discovers and returns every field | Deep investigation / hunting, when you need full event context |
+
+> Verbose es el más caro: úsalo para investigar, no para alertas. Fast mode es el que querés en dashboards y búsquedas programadas.
 
 ---
 
